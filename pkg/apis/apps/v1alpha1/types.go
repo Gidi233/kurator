@@ -23,6 +23,8 @@ import (
 	kustomizev1beta2 "github.com/fluxcd/kustomize-controller/api/v1beta2"
 	sourcev1beta2 "github.com/fluxcd/source-controller/api/v1beta2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ingressv1 "k8s.io/api/networking/v1"
+	fleetapi "kurator.dev/kurator/pkg/apis/fleet/v1alpha1"
 )
 
 // +genclient
@@ -116,10 +118,9 @@ type RolloutConfig struct {
 	TestLoader *bool `json:"testLoader,omitempty"`
 
 	// TrafficRoutingProvider defines traffic routing provider.
-	// Kurator only supports istio for now.
+	// Kurator supports istio,kuma,nginx for now.
 	// Other provider will be added later.
-	// +optional
-	TrafficRoutingProvider string `json:"trafficRoutingProvider,omitempty"`
+	TrafficRoutingProvider fleetapi.Provider `json:"trafficRoutingProvider"`
 
 	// Workload specifies what workload to deploy the test to.
 	// Workload of type Deployment or DaemonSet.
@@ -192,6 +193,36 @@ type TrafficRoutingConfig struct {
 	// Defaults to the RolloutConfig.ServiceName
 	// +optional
 	Hosts []string `json:"hosts,omitempty"`
+
+	// for NGINX
+	// The default created ingress is as follows, (replace app.example.com with your own domain, and change the path matching rules as needed)
+	// apiVersion: networking.k8s.io/v1
+	// kind: Ingress
+	// metadata:
+	//   name: application.syncPolicies.rollout.Workload.name
+	//   namespace: application.syncPolicies.rollout.Workload.namespace
+	//   labels:
+	//     app: application.syncPolicies.rollout.Workload.name
+	//   annotations:
+	//     kubernetes.io/ingress.class: "nginx"
+	// spec:
+	//   rules:
+	//     - host: "app.example.com"
+	//       http:
+	//         paths:
+	//           - pathType: Prefix
+	//             path: "/"
+	//             backend:
+	//               service:
+	//                 name: application.syncPolicies.rollout.Workload.name
+	//                 port:
+	//                   number: 80	
+	// +optional
+	Ingress *ingressv1.IngressSpec `json:"ingress,omitempty"`
+	// for kuma
+	// Defaults to http
+	// +optional
+	Protocol string `json:"protocol,omitempty"`
 
 	// Retries describes the retry policy to use when a HTTP request fails.
 	// For example, the following rule sets the maximum number of retries to three,

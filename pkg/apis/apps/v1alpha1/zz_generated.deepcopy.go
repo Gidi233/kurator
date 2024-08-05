@@ -29,6 +29,7 @@ import (
 	kustomize "github.com/fluxcd/pkg/apis/kustomize"
 	meta "github.com/fluxcd/pkg/apis/meta"
 	v1beta2 "github.com/fluxcd/source-controller/api/v1beta2"
+	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
@@ -842,6 +843,11 @@ func (in *TrafficRoutingConfig) DeepCopyInto(out *TrafficRoutingConfig) {
 		in, out := &in.Hosts, &out.Hosts
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.Ingress != nil {
+		in, out := &in.Ingress, &out.Ingress
+		*out = new(networkingv1.IngressSpec)
+		(*in).DeepCopyInto(*out)
 	}
 	if in.Retries != nil {
 		in, out := &in.Retries, &out.Retries

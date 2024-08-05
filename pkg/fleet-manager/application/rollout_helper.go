@@ -25,10 +25,13 @@ import (
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	ingressv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/yaml"
 
 	applicationapi "kurator.dev/kurator/pkg/apis/apps/v1alpha1"
@@ -41,10 +44,14 @@ import (
 const (
 	// kurator rollout labels
 	RolloutIdentifier = "kurator.dev/rollout"
-	sidecarInject     = "istio-injection"
-
+	istioInject       = "istio-injection"
+	kumaInject        = "kuma.io/sidecar-injection"
 	// StatusSyncInterval specifies the interval for requeueing when synchronizing status. It determines how frequently the status should be checked and updated.
 	StatusSyncInterval = 30 * time.Second
+
+	// resources config
+	ingressAPIVersion = "networking.k8s.io/v1"
+	ingressKind       = "Ingress"
 )
 
 func (a *ApplicationManager) fetchRolloutClusters(ctx context.Context,
@@ -98,20 +105,39 @@ func (a *ApplicationManager) syncRolloutPolicyForCluster(ctx context.Context,
 	annotation := map[string]string{
 		RolloutIdentifier: policyName,
 	}
+	provider := rolloutPolicy.TrafficRoutingProvider
 
 	for clusterKey, fleetCluster := range destinationClusters {
 		fleetClusterClient := fleetCluster.Client.CtrlRuntimeClient()
-
-		// If the trafficRoutingProvider is Istio, add the sidecar injection label to the workload's namespace.
-		if rolloutPolicy.TrafficRoutingProvider == "istio" {
-			err := enableIstioSidecarInjection(ctx, fleetClusterClient, rolloutPolicy.Workload.Namespace)
+		switch provider {
+		// If the trafficRoutingProvider is Istio or Kuma, add the sidecar injection label/Annotations to the workload's namespace.
+		case fleetapi.Istio, fleetapi.Kuma:
+			err := enableSidecarInjection(ctx, fleetClusterClient, rolloutPolicy.Workload.Namespace, provider, annotation)
 			if err != nil {
-				return ctrl.Result{}, errors.Wrapf(err, "failed to set namespace %s istio-injection enable", rolloutPolicy.Workload.Namespace)
+				return ctrl.Result{}, errors.Wrapf(err, "failed to set namespace %s %s's Inject enable", rolloutPolicy.Workload.Namespace, provider)
 			}
+		case fleetapi.Nginx:
+			ingress := &ingressv1.Ingress{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      rolloutPolicy.Workload.Name,
+					Namespace: rolloutPolicy.Workload.Namespace,
+				},
+			}
+			result, err := controllerutil.CreateOrUpdate(ctx, a.Client, ingress, func() error {
+				renderIngress(ingress, rolloutPolicy)
+				ingress.SetAnnotations(annotation)
+				return nil
+			})
+			if err != nil {
+				return ctrl.Result{}, errors.Wrapf(err, "failed to operate ingress")
+			}
+			log.Info("sync nginx result:", result)
+		default:
+			return ctrl.Result{}, errors.Errorf("unknown provider type %s", provider)
 		}
-
+		log.Info("pre-operation of operating canary success")
 		// if delete private testloader when rollout polity has changed
-		if rolloutPolicy.TestLoader == nil || !*rolloutPolicy.TestLoader {
+		if rolloutPolicy.TestLoader == nil || !*rolloutPolicy.TestLoader { //放到webhook里
 			testloaderDeploy := &appsv1.Deployment{}
 			if err := deleteResourceCreatedByKurator(ctx, testloaderNamespaceName, fleetClusterClient, testloaderDeploy); err != nil {
 				return ctrl.Result{}, err
@@ -228,6 +254,14 @@ func (a *ApplicationManager) deleteResourcesInMemberClusters(ctx context.Context
 			return errors.Wrapf(err, "failed to fetch destination clusters when delete rollout resource")
 		}
 
+		namespacedName := types.NamespacedName{
+			Namespace: rolloutPolicy.Workload.Namespace,
+			Name:      rolloutPolicy.Workload.Namespace,
+		}
+		ingressName := types.NamespacedName{
+			Namespace: rolloutPolicy.Workload.Namespace,
+			Name:      rolloutPolicy.Workload.Name,
+		}
 		serviceNamespaceName := types.NamespacedName{
 			Namespace: rolloutPolicy.Workload.Namespace,
 			Name:      rolloutPolicy.ServiceName,
@@ -238,6 +272,15 @@ func (a *ApplicationManager) deleteResourcesInMemberClusters(ctx context.Context
 		}
 		for _, cluster := range destinationClusters {
 			newClient := cluster.Client.CtrlRuntimeClient()
+
+			ns := &corev1.Namespace{}
+			if err := deleteResourceCreatedByKurator(ctx, namespacedName, newClient, ns); err != nil {
+				return errors.Wrapf(err, "failed to delete namespace")
+			}
+			ingress := &ingressv1.Ingress{}
+			if err := deleteResourceCreatedByKurator(ctx, ingressName, newClient, ingress); err != nil {
+				return errors.Wrapf(err, "failed to delete ingress")
+			}
 			testloaderDeploy := &appsv1.Deployment{}
 			if err := deleteResourceCreatedByKurator(ctx, testloaderNamespaceName, newClient, testloaderDeploy); err != nil {
 				return errors.Wrapf(err, "failed to delete testloader deployment")
@@ -256,7 +299,7 @@ func (a *ApplicationManager) deleteResourcesInMemberClusters(ctx context.Context
 	return nil
 }
 
-func enableIstioSidecarInjection(ctx context.Context, kubeClient client.Client, namespace string) error {
+func enableSidecarInjection(ctx context.Context, kubeClient client.Client, namespace string, provider fleetapi.Provider, annotation map[string]string) error {
 	log := ctrl.LoggerFrom(ctx)
 
 	ns := &corev1.Namespace{}
@@ -268,9 +311,13 @@ func enableIstioSidecarInjection(ctx context.Context, kubeClient client.Client, 
 		// if no found, create a namespace
 		if apierrors.IsNotFound(err) {
 			ns.SetName(namespace)
-			ns.SetLabels(map[string]string{
-				sidecarInject: "enabled",
-			})
+			switch provider {
+			case fleetapi.Kuma:
+				annotation[kumaInject] = "enabled"
+			case fleetapi.Istio:
+				ns.SetLabels(map[string]string{istioInject: "enabled"})
+			}
+			ns.SetAnnotations(annotation)
 			if createErr := kubeClient.Create(ctx, ns); createErr != nil {
 				return errors.Wrapf(createErr, "failed to create namespace %s", namespacedName.Namespace)
 			}
@@ -279,8 +326,14 @@ func enableIstioSidecarInjection(ctx context.Context, kubeClient client.Client, 
 			return err
 		}
 	} else {
-		ns := addLabels(ns, sidecarInject, "enabled")
-		if updateErr := kubeClient.Update(ctx, ns); updateErr != nil {
+		var newNs client.Object
+		switch provider {
+		case fleetapi.Kuma:
+			newNs = addAnnotations(ns, kumaInject, "enabled")
+		case fleetapi.Istio:
+			newNs = addLabels(ns, istioInject, "enabled")
+		}
+		if updateErr := kubeClient.Update(ctx, newNs); updateErr != nil {
 			return errors.Wrapf(updateErr, "failed to update namespace %s", namespacedName.Namespace)
 		}
 	}
@@ -352,6 +405,17 @@ func deleteResourceCreatedByKurator(ctx context.Context, namespaceName types.Nam
 	return nil
 }
 
+// create/update ingress configuration
+func renderIngress(ingress *ingressv1.Ingress, rollout *applicationapi.RolloutConfig) {
+	ingress.APIVersion = ingressAPIVersion
+	ingress.Kind = ingressKind
+	ingress.Name = rollout.Workload.Name
+	ingress.Namespace = rollout.Workload.Namespace
+	ingress.SetLabels(map[string]string{"app": rollout.Workload.Name})
+	ingress.SetAnnotations(map[string]string{"kubernetes.io/ingress.class:": "nginx"})
+	ingress.Spec = *rollout.RolloutPolicy.TrafficRouting.Ingress
+}
+
 // create/update canary configuration
 func renderCanary(rolloutPolicy applicationapi.RolloutConfig, canaryInCluster *flaggerv1b1.Canary) *flaggerv1b1.Canary {
 	canaryInCluster.ObjectMeta.Namespace = rolloutPolicy.Workload.Namespace
@@ -359,7 +423,7 @@ func renderCanary(rolloutPolicy applicationapi.RolloutConfig, canaryInCluster *f
 	canaryInCluster.TypeMeta.Kind = "Canary"
 	canaryInCluster.TypeMeta.APIVersion = "flagger.app/v1beta1"
 	canaryInCluster.Spec = flaggerv1b1.CanarySpec{
-		Provider: rolloutPolicy.TrafficRoutingProvider,
+		Provider: string(rolloutPolicy.TrafficRoutingProvider),
 		TargetRef: flaggerv1b1.LocalObjectReference{
 			APIVersion: rolloutPolicy.Workload.APIVersion,
 			Kind:       rolloutPolicy.Workload.Kind,
@@ -370,7 +434,16 @@ func renderCanary(rolloutPolicy applicationapi.RolloutConfig, canaryInCluster *f
 		RevertOnDeletion:        rolloutPolicy.RolloutPolicy.RevertOnDeletion,
 		Suspend:                 rolloutPolicy.RolloutPolicy.Suspend,
 	}
-
+	switch rolloutPolicy.TrafficRoutingProvider {
+	case fleetapi.Nginx:
+		canaryInCluster.Spec.IngressRef = &flaggerv1b1.LocalObjectReference{
+			APIVersion: ingressAPIVersion,
+			Kind:       ingressKind,
+			Name:       rolloutPolicy.Workload.Name,
+		}
+	case fleetapi.Kuma:
+		canaryInCluster.SetAnnotations(map[string]string{"kuma.io/mesh": "default"})
+	}
 	return canaryInCluster
 }
 
@@ -380,17 +453,24 @@ func renderCanaryService(rolloutPolicy applicationapi.RolloutConfig, service *co
 	}
 	ports := service.Spec.Ports
 	canaryService := &flaggerv1b1.CanaryService{
-		Name:       rolloutPolicy.ServiceName,
-		Port:       rolloutPolicy.Port,
-		Gateways:   rolloutPolicy.RolloutPolicy.TrafficRouting.Gateways,
-		Hosts:      rolloutPolicy.RolloutPolicy.TrafficRouting.Hosts,
-		Retries:    rolloutPolicy.RolloutPolicy.TrafficRouting.Retries,
-		Headers:    rolloutPolicy.RolloutPolicy.TrafficRouting.Headers,
-		CorsPolicy: rolloutPolicy.RolloutPolicy.TrafficRouting.CorsPolicy,
-		Primary:    (*flaggerv1b1.CustomMetadata)(rolloutPolicy.Primary),
-		Canary:     (*flaggerv1b1.CustomMetadata)(rolloutPolicy.Preview),
+		Name: rolloutPolicy.ServiceName,
+		Port: rolloutPolicy.Port,
 	}
-
+	switch rolloutPolicy.TrafficRoutingProvider {
+	case fleetapi.Istio:
+		canaryService.Gateways = rolloutPolicy.RolloutPolicy.TrafficRouting.Gateways
+		canaryService.Hosts = rolloutPolicy.RolloutPolicy.TrafficRouting.Hosts
+		canaryService.Retries = rolloutPolicy.RolloutPolicy.TrafficRouting.Retries
+		canaryService.Headers = rolloutPolicy.RolloutPolicy.TrafficRouting.Headers
+		canaryService.CorsPolicy = rolloutPolicy.RolloutPolicy.TrafficRouting.CorsPolicy
+		canaryService.Primary = (*flaggerv1b1.CustomMetadata)(rolloutPolicy.Primary)
+		canaryService.Canary = (*flaggerv1b1.CustomMetadata)(rolloutPolicy.Preview)
+	case fleetapi.Kuma:
+		annotations := &flaggerv1b1.CustomMetadata{Annotations: map[string]string{"9898.service.kuma.io/protocol": rolloutPolicy.RolloutPolicy.TrafficRouting.Protocol}}
+		canaryService.Apex = annotations
+		canaryService.Canary = annotations
+		canaryService.Primary = annotations
+	}
 	Timeout := fmt.Sprintf("%d", rolloutPolicy.RolloutPolicy.TrafficRouting.TimeoutSeconds) + "s"
 	canaryService.Timeout = Timeout
 
@@ -490,6 +570,20 @@ func addLabels(obj client.Object, key, value string) client.Object {
 	}
 	labels[key] = value
 	obj.SetLabels(labels)
+	return obj
+}
+
+func addAnnotations(obj client.Object, key, value string) client.Object {
+	annotations := obj.GetAnnotations()
+	// prevent nil pointer panic
+	if annotations == nil {
+		obj.SetAnnotations(map[string]string{
+			key: value,
+		})
+		return obj
+	}
+	annotations[key] = value
+	obj.SetAnnotations(annotations)
 	return obj
 }
 

@@ -237,7 +237,7 @@ type KyvernoConfig struct {
 	// PodSecurity defines the pod security configuration for the kyverno.
 	// +optional
 	PodSecurity *PodSecurityPolicy `json:"podSecurity,omitempty"`
-	// ExtraArgs is the set of extra arguments for Grafana chart.
+	// ExtraArgs is the set of extra arguments for kyverno chart.
 	// For Example, using following configuration to change image pull policy.
 	//
 	// ```yaml
@@ -560,13 +560,28 @@ type FlaggerConfig struct {
 	// TrafficRoutingProvider defines traffic routing provider.
 	// And Kurator will install flagger in trafficRoutingProvider's namespace
 	// For example, If you use `istio` as a provider, flager will be installed in istio's namespace `istio-system`.
+	// And if you use `istio` as a provider, you need to install it manually.
+	// Otherwise, you can configure it in ProviderConfig (or use the default configuration) and Kurator will automatically deploy it.
 	// Other provider will be added later.
-	// +optional
-	TrafficRoutingProvider Provider `json:"trafficRoutingProvider,omitempty"`
+	TrafficRoutingProvider Provider `json:"trafficRoutingProvider"`
 	// PublicTestloader defines whether to install the publictestloader or not.
 	// In addition to the public testloader you can configure here,
 	// you can also specify a private testloader in the Application.Spec.SyncPolicies.Rollout.TestLoader
 	PublicTestloader bool `json:"publicTestloader,omitempty"`
+	// ProviderConfig defines the configuration for the TrafficRoutingProvider.
+	// +optional
+	ProviderConfig *Config `json:"Config,omitempty"`
+}
+
+type Config struct {
+	// Chart defines the helm chart config of the TrafficRoutingProvider.
+	// default value is in ./pkg/fleet-manager/manifests/plugins/
+	// +optional
+	Chart *ChartConfig `json:"chart,omitempty"`
+	// ExtraArgs is the set of extra arguments for TrafficRoutingProvider's chart.
+	// You can pass in values according to your needs.
+	// +optional
+	ExtraArgs apiextensionsv1.JSON `json:"extraArgs,omitempty"`
 }
 
 // Provider only can be istio now.
@@ -575,6 +590,8 @@ type Provider string
 
 const (
 	Istio Provider = "istio"
+	Kuma  Provider = "kuma"
+	Nginx Provider = "nginx"
 )
 
 // FleetStatus defines the observed state of the fleet

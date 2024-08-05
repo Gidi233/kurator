@@ -19,7 +19,9 @@ package scheme
 import (
 	hrapiv2b1 "github.com/fluxcd/helm-controller/api/v2beta1"
 	"k8s.io/apimachinery/pkg/runtime"
-	kubescheme "k8s.io/client-go/kubernetes/scheme"
+	kubescheme "k8s.io/client-go/kubernetes/scheme"	
+	ingressv1 "k8s.io/api/networking/v1"
+
 
 	applicationapi "kurator.dev/kurator/pkg/apis/apps/v1alpha1"
 	backupapi "kurator.dev/kurator/pkg/apis/backups/v1alpha1"
@@ -40,4 +42,5 @@ func init() {
 	_ = applicationapi.AddToScheme(Scheme)
 	_ = backupapi.AddToScheme(Scheme)
 	_ = pipelineapi.AddToScheme(Scheme)
+	_ = ingressv1.AddToScheme(Scheme)
 }
